@@ -1,0 +1,1076 @@
+From fd1c9ba5e1109261896805b33f957b3d7dd79051 Mon Sep 17 00:00:00 2001
+From: Alfred Neumayer <dev.beidl@gmail.com>
+Date: Sun, 25 Dec 2022 16:00:25 +0100
+Subject: [PATCH] qtwebengine-chromium: Add VP8, VP9 & H264 video decoding
+ support
+
+Uses libhybris' libmedia_compat_layer to achieve video decoding.
+---
+ .../chromium/media/gpu/BUILD.gn               |  18 +-
+ .../media/gpu/hybris/video_decoder_hybris.cc  | 709 ++++++++++++++++++
+ .../media/gpu/hybris/video_decoder_hybris.h   | 166 ++++
+ .../chromium/media/media_options.gni          |   2 +-
+ .../chromium/media/mojo/services/BUILD.gn     |   8 +
+ .../mojo/services/gpu_mojo_media_client.cc    |  37 +-
+ src/core/core_module.pro                      |   2 +-
+ 7 files changed, 930 insertions(+), 12 deletions(-)
+ create mode 100644 qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.cc
+ create mode 100644 qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.h
+
+diff --git a/qtwebengine-chromium/chromium/media/gpu/BUILD.gn b/qtwebengine-chromium/chromium/media/gpu/BUILD.gn
+index b1a84b1ad..03369097a 100644
+--- a/qtwebengine-chromium/chromium/media/gpu/BUILD.gn
++++ b/qtwebengine-chromium/chromium/media/gpu/BUILD.gn
+@@ -5,12 +5,12 @@
+ import("//build/buildflag_header.gni")
+ import("//build/config/features.gni")
+ import("//build/config/ui.gni")
++import("//build/config/linux/pkg_config.gni")
+ import("//gpu/vulkan/features.gni")
+ import("//media/gpu/args.gni")
+ import("//media/media_options.gni")
+ import("//testing/test.gni")
+ import("//tools/generate_stubs/rules.gni")
+-
+ buildflag_header("buildflags") {
+   header = "buildflags.h"
+ 
+@@ -20,7 +20,11 @@ buildflag_header("buildflags") {
+     "USE_LIBV4L2=$use_v4lplugin",
+   ]
+ }
+-
++pkg_config("libmedia") {
++  packages = [
++    "libmedia",
++  ]
++}
+ component("gpu") {
+   output_name = "media_gpu"
+ 
+@@ -94,6 +98,16 @@ component("gpu") {
+     public_deps += [ "//media/gpu/mac" ]
+   }
+ 
++  if (is_linux) {
++    defines += [ "ENABLE_HYBRIS_MEDIA" ]
++    sources += [
++      "hybris/video_decoder_hybris.cc",
++      "hybris/video_decoder_hybris.h",
++      "//media/base/android/extract_sps_and_pps.cc",
++      "//media/base/android/extract_sps_and_pps.h",
++    ]
++  }
++
+   if (is_android) {
+     sources += [
+       "android/android_video_surface_chooser.cc",
+diff --git a/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.cc b/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.cc
+new file mode 100644
+index 000000000..a67e5ce6d
+--- /dev/null
++++ b/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.cc
+@@ -0,0 +1,709 @@
++// Copyright 2022 Alfred Neumayer. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/hybris/video_decoder_hybris.h"
++#include "media/formats/mp4/box_definitions.h"
++#include "base/task/task_traits.h"
++#include "base/task/thread_pool.h"
++#include "gpu/ipc/service/command_buffer_stub.h"
++#include "ui/gl/gl_bindings.h"
++#include "ui/gl/gl_context.h"
++#include "ui/gl/gl_implementation.h"
++#include "ui/gl/gl_surface.h"
++#include "ui/gl/scoped_binders.h"
++#include "ui/gl/init/gl_factory.h"
++
++#define BUFFER_FLAG_KEY_FRAME        1
++#define BUFFER_FLAG_CODEC_CONFIG     2
++#define BUFFER_FLAG_END_OF_STREAM    4
++#define INFO_TRY_AGAIN_LATER        -1
++#define INFO_OUTPUT_FORMAT_CHANGED  -2
++#define INFO_OUTPUT_BUFFERS_CHANGED -4
++
++extern "C" {
++int media_compat_check_availability();
++}
++
++namespace media {
++
++// Support decoders without CSD for now
++static const char* kVideoMimeTypeH264 = "video/avc";
++static const char* kVideoMimeTypeVP8 = "video/x-vnd.on2.vp8";
++static const char* kVideoMimeTypeVP9 = "video/x-vnd.on2.vp9";
++//static const char* kVideoMimeTypeHEVC = "video/hevc";
++
++std::vector<SupportedVideoDecoderConfig> HybrisMediaCodecVideoDecoder::GetSupportedConfigs() {
++  static const auto configs = GetSupportedConfigsInternal();
++  return configs;
++}
++
++std::vector<SupportedVideoDecoderConfig> HybrisMediaCodecVideoDecoder::GetSupportedConfigsInternal() {
++  std::vector<SupportedVideoDecoderConfig> supported_configs;
++
++  // We don't compile support into libvpx for these profiles, so allow them
++  // for all resolutions. See notes on H264 profiles below for more detail.
++  supported_configs.emplace_back(VP8PROFILE_MIN, VP8PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++  supported_configs.emplace_back(VP8PROFILE_MIN, VP8PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++
++  // Encrypted content must be decoded by MediaCodec.
++  supported_configs.emplace_back(VP8PROFILE_MIN, VP8PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(3840, 2160),
++                                 true,   // allow_encrypted
++                                 true);  // require_encrypted
++  supported_configs.emplace_back(VP8PROFILE_MIN, VP8PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(2160, 3840),
++                                 true,   // allow_encrypted
++                                 true);  // require_encrypted
++
++  // We don't compile support into libvpx for these profiles, so allow them
++  // for all resolutions. See notes on H264 profiles below for more detail.
++  supported_configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++  supported_configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++
++  // Encrypted content must be decoded by MediaCodec.
++  supported_configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(3840, 2160),
++                                 true,   // allow_encrypted
++                                 true);  // require_encrypted
++  supported_configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++                                 gfx::Size(0, 0),
++                                 gfx::Size(2160, 3840),
++                                 true,   // allow_encrypted
++                                 true);  // require_encrypted
++
++  supported_configs.emplace_back(H264PROFILE_MIN, H264PROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++  supported_configs.emplace_back(H264PROFILE_MIN, H264PROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++
++  supported_configs.emplace_back(H264PROFILE_MIN, H264PROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 true);  // require_encrypted
++  supported_configs.emplace_back(H264PROFILE_MIN, H264PROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 true);  // require_encrypted
++
++#if 0
++  supported_configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++  supported_configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 false);  // require_encrypted
++
++  supported_configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(3840, 2160),
++                                 true,    // allow_encrypted
++                                 true);  // require_encrypted
++  supported_configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++                                 gfx::Size(0, 0), gfx::Size(2160, 3840),
++                                 true,    // allow_encrypted
++                                 true);  // require_encrypted
++#endif
++
++  return supported_configs;
++}
++
++  HybrisMediaCodecVideoDecoder::HybrisMediaCodecVideoDecoder(
++      scoped_refptr<base::SingleThreadTaskRunner> task_runner,
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++      GetStubCB stub_cb) :
++        eos_cb_called_(true),
++        running_(false),
++        n_buffers_in_(0),
++        n_buffers_out_(0),
++        queue_timeout_(10000),
++        media_codec_(nullptr),
++        media_format_(nullptr),
++        stc_(nullptr),
++        pending_output_runner_(base::ThreadPool::CreateSingleThreadTaskRunner(
++          {base::TaskPriority::USER_VISIBLE})),
++        task_runner_(task_runner),
++        gpu_task_runner_(gpu_task_runner) {
++    gpu::CommandBufferStub* stub = std::move(stub_cb).Run();
++    decoder_context_ = stub->decoder_context();
++    decoder_helper_ = GLES2DecoderHelper::Create(decoder_context_);
++  }
++
++  HybrisMediaCodecVideoDecoder::~HybrisMediaCodecVideoDecoder()  {
++    Destroy();
++  }
++
++  bool HybrisMediaCodecVideoDecoder::IsSupportedProfile(VideoCodecProfile type)
++  {
++    if ((type >= H264PROFILE_MIN && type <= H264PROFILE_MAX) ||
++        (type >= VP8PROFILE_MIN && type <= VP8PROFILE_MAX) ||
++        (type >= VP9PROFILE_MIN && type <= VP9PROFILE_MAX) /* ||
++        (type >= HEVCPROFILE_MIN && type <= HEVCPROFILE_MAX) */ ) {
++      return true;
++    }
++    return false;
++  }
++
++  bool HybrisMediaCodecVideoDecoder::IsSupported(VideoCodecProfile type)
++  {
++    if (!IsSupportedProfile(type)) {
++      return false;
++    }
++
++    const char* hybris_codec_type = MimeTypeForCodecType(type);
++    if (!hybris_codec_type) {
++      return false;
++    }
++
++    std::string codec_type = std::string(hybris_codec_type);
++    std::string hybris_codec_name = FindSuitableCodec(codec_type, true);
++    if (hybris_codec_name.length() == 0) {
++      hybris_codec_name = FindSuitableCodec(codec_type, false);
++    }
++    return (hybris_codec_name.length() > 0);
++  }
++
++  const char* HybrisMediaCodecVideoDecoder::MimeTypeForCodecType(VideoCodecProfile type) {
++    if (type >= H264PROFILE_MIN && type <= H264PROFILE_MAX) {
++      return kVideoMimeTypeH264;
++    } else if (type >= VP8PROFILE_MIN && type <= VP8PROFILE_MAX) {
++      return kVideoMimeTypeVP8;
++    } else if (type >= VP9PROFILE_MIN && type <= VP9PROFILE_MAX) {
++      return kVideoMimeTypeVP9;
++    } /* else if (type >= HEVCPROFILE_MIN && type <= HEVCPROFILE_MAX) {
++      return kVideoMimeTypeHEVC;
++    } */
++    return nullptr;
++  }
++
++  std::string HybrisMediaCodecVideoDecoder::FindSuitableCodec(const std::string& codec_type, const bool hwCodecOnly) {
++    std::string hybris_codec_name;
++
++    // Find a decoder corresponding to our requested type
++    const size_t media_codec_num = media_codec_list_count_codecs();
++    for (size_t media_codec_pos = 0; media_codec_pos < media_codec_num; media_codec_pos++) {
++      media_codec_list_get_codec_info_at_id(media_codec_pos);
++
++      if (media_codec_list_is_encoder(media_codec_pos))
++        continue;
++
++      const char* codec_name_ptr = media_codec_list_get_codec_name(media_codec_pos);
++      if (!codec_name_ptr)
++        continue;
++
++      std::string codec_name(codec_name_ptr);
++
++      if (hwCodecOnly) {
++        if (codec_name.rfind("OMX.google.", 0) == 0)
++          continue;
++      }
++
++      LOG(INFO) << "Inspecting codec: " << codec_name;
++
++      const size_t num_supported_types = media_codec_list_get_num_supported_types(media_codec_pos);
++      for (size_t supported_type_pos = 0; supported_type_pos < num_supported_types; supported_type_pos++) {
++        const size_t mime_len = media_codec_list_get_nth_supported_type_len(media_codec_pos, supported_type_pos);
++        if (mime_len == 0)
++          continue;
++
++        char* potential_mime = new char[mime_len + 1]();
++        media_codec_list_get_nth_supported_type(media_codec_pos, potential_mime, supported_type_pos);
++        if (!potential_mime)
++          continue;
++
++        potential_mime[mime_len] = '\0';
++        std::string potential_type(potential_mime);
++        LOG(INFO) << "Type: " << potential_type;
++
++        if (potential_type == codec_type) {
++          LOG(INFO) << "Found codec for type " << potential_type << ", called " << codec_name;
++          hybris_codec_name = codec_name;
++          delete[] potential_mime;
++          break;
++        }
++
++        delete[] potential_mime;
++      }
++
++      if (hybris_codec_name.length() > 0)
++        break;
++    }
++
++    return hybris_codec_name;
++  }
++
++bool HybrisMediaCodecVideoDecoder::IsPlatformDecoder() const {
++  return true;
++}
++
++bool HybrisMediaCodecVideoDecoder::SupportsDecryption() const {
++  return false;
++}
++
++void HybrisMediaCodecVideoDecoder::Initialize(
++                const VideoDecoderConfig& config,
++                bool low_delay,
++                CdmContext* cdm_context,
++                InitCB init_cb,
++                const OutputCB& output_cb,
++                const WaitingCB& waiting_cb) {
++  if (!IsSupportedProfile(config.profile())) {
++    return;
++  }
++
++  // Initialize hybris compat layer
++  const char* hybris_codec_type = MimeTypeForCodecType(config.profile());
++  if (!hybris_codec_type) {
++    return;
++  }
++
++  codec_type_ = std::string(hybris_codec_type);
++
++  // Look for hardware-codecs first
++  std::string hybris_codec_name = FindSuitableCodec(codec_type_, true);
++  if (hybris_codec_name.length() == 0) {
++    hybris_codec_name = FindSuitableCodec(codec_type_, false);
++  }
++
++  if (hybris_codec_name.length() == 0) {
++    LOG(INFO) << "Didn't find a suitable Hybris codec";
++    return;
++  }
++
++  media_codec_ = media_codec_create_by_codec_name(hybris_codec_name.c_str());
++  if (!media_codec_) {
++    LOG(INFO) << "Couldn't create Hybris codec by name: " << hybris_codec_name;
++    return;
++  }
++
++  n_buffers_in_ = media_codec_get_input_buffers_size(media_codec_);
++  output_cb_ = output_cb;
++  config_ = config;
++
++  gpu_task_runner_->PostTask(
++      FROM_HERE,
++          base::BindOnce(&HybrisMediaCodecVideoDecoder::Reconfigure,
++              base::Unretained(this), config, std::move(init_cb)));
++}
++
++void HybrisMediaCodecVideoDecoder::PumpCodec() {
++  std::lock_guard<decltype(running_mutex_)> lk(running_mutex_);
++  while (queue_.size() > 0) {
++    while (!ProcessInput(queue_.front()));
++    queue_.pop_front();
++  }
++}
++
++bool HybrisMediaCodecVideoDecoder::ProcessInput(
++    QueuedBuffer& in_flight_buffer) {
++  LOG(INFO) << __func__;
++
++  int32_t flags_for_input = 0;
++  if (in_flight_buffer.buffer->is_key_frame()) {
++    flags_for_input |= BUFFER_FLAG_KEY_FRAME;
++  }
++  if (in_flight_buffer.buffer->end_of_stream()) {
++    flags_for_input |= BUFFER_FLAG_END_OF_STREAM;
++  }
++
++  size_t offset = SkipForbiddenNALUs(in_flight_buffer.buffer->data(),
++                                     in_flight_buffer.buffer->data_size());
++  size_t buf_index;
++  uint8_t* input_ptr = nullptr;
++  int ret;
++  int dequeue_attempts = 1;
++
++  while (!input_ptr && --dequeue_attempts >= 0) {
++    ret = media_codec_dequeue_input_buffer(media_codec_, &buf_index, queue_timeout_);
++    if (ret >= 0) {
++      input_ptr = codec_input_buffers_[buf_index].data;
++    }
++  }
++
++  if (!input_ptr) {
++    // Let's try again later
++    return false;
++  }
++
++  // Fill the input buffer
++  const size_t capacity = codec_input_buffers_[buf_index].size;
++  const size_t mem_size = std::min<size_t>(in_flight_buffer.buffer->data_size(), capacity);
++  LOG(INFO) << "Capacity " << capacity << " vs mem_size " << mem_size;
++  if (mem_size > 0) {
++    memcpy(input_ptr, in_flight_buffer.buffer->data(), mem_size);
++  }
++
++  const int64_t presentation_time =
++      in_flight_buffer.buffer->timestamp().InMicroseconds();
++
++  // Queue it into the decoder
++  MediaCodecBufferInfo buffer_info;
++  memset(&buffer_info, 0, sizeof(buffer_info));
++  buffer_info.index = buf_index;
++  buffer_info.size = mem_size;
++  buffer_info.flags = flags_for_input;
++  buffer_info.presentation_time_us = presentation_time;
++  buffer_info.offset = offset;
++  ret = media_codec_queue_input_buffer(media_codec_, &buffer_info);
++
++  if (ret < 0) {
++    LOG(INFO) << "Error in " << __func__ << ":" << __LINE__;
++    return false;
++  }
++
++  RunPipeline(in_flight_buffer);
++  return true;
++}
++
++void HybrisMediaCodecVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer, DecodeCB decode_cb)  {
++  LOG(INFO) << __func__;
++
++  if (!buffer) {
++    LOG(INFO) << "No buffer provided!";
++    return;
++  }
++
++  if (buffer->end_of_stream()) {
++    media_codec_flush(media_codec_);
++    queue_timeout_ = 10000;
++    std::move(decode_cb).Run(DecodeStatus::OK);
++    eos_cb_called_ = true;
++    LOG(INFO) << "EOS!";
++    return;
++  }
++
++  eos_cb_called_ = false;
++
++  {
++    std::lock_guard<decltype(running_mutex_)> lk(running_mutex_);
++    QueuedBuffer next_input { buffer, std::move(decode_cb) };
++    queue_.push_back(std::move(next_input));
++  }
++
++  // Do it like Android
++  const auto kPollingPeriod = base::TimeDelta::FromMilliseconds(10);
++  if (!pump_codec_timer_.IsRunning()) {
++    pump_codec_timer_.Start(FROM_HERE, kPollingPeriod,
++                            base::Bind(&HybrisMediaCodecVideoDecoder::PumpCodec,
++                                       base::Unretained(this)));
++  }
++}
++
++void HybrisMediaCodecVideoDecoder::FrameAvailable(int64_t decode_timestamp) {
++  gpu_task_runner_->PostTask(
++      FROM_HERE, base::BindOnce(&HybrisMediaCodecVideoDecoder::RedrawTexture,
++          base::Unretained(this), decode_timestamp));
++}
++
++void HybrisMediaCodecVideoDecoder::RedrawTexture(int64_t decode_timestamp) {
++  if (!decoder_context_) {
++    return;
++  }
++
++  if (!gl_texture.get()) {
++    return;
++  }
++
++  if (!decoder_helper_) {
++    return;
++  }
++
++  std::lock_guard<decltype(redraw_mutex_)> lk(redraw_mutex_);
++
++  decoder_context_->MakeCurrent();
++  surface_texture_client_update_texture(stc_);
++
++  base::TimeDelta timestamp = base::TimeDelta::FromMicroseconds(decode_timestamp);
++  VideoPixelFormat pixel_format = PIXEL_FORMAT_ABGR;
++
++  gpu::Mailbox mailbox = decoder_helper_->CreateMailbox(gl_texture.get());
++  gpu::SyncToken sync_token = gpu::SyncToken();
++  gpu::MailboxHolder mailbox_holders_[VideoFrame::kMaxPlanes];
++  mailbox_holders_[0] = gpu::MailboxHolder(mailbox, sync_token, GL_TEXTURE_EXTERNAL_OES);
++
++  auto frame = VideoFrame::WrapNativeTextures(
++      pixel_format, mailbox_holders_, VideoFrame::ReleaseMailboxCB(),
++      coded_size_, visible_rect_, natural_size_, timestamp);
++
++  if (!frame) {
++    return;
++  }
++
++  frame->metadata()->power_efficient = true;
++  output_cb_.Run(frame);
++
++  // We can safely reduce the timeout for de-/queueing now
++  queue_timeout_ = 10000;
++}
++
++void HybrisMediaCodecVideoDecoder::Destroy() {
++  std::lock_guard<decltype(running_mutex_)> lk(running_mutex_);
++
++  running_ = false;
++  pump_codec_timer_.Stop();
++
++  while (queue_.size() > 0)
++    queue_.pop_back();
++
++  if (media_codec_) {
++    media_codec_flush(media_codec_);
++    media_codec_stop(media_codec_);
++    media_codec_delegate_destroy(media_codec_);
++    media_codec_ = nullptr;
++  }
++
++  if (stc_) {
++    stc_ = nullptr;
++  }
++
++  if (media_format_) {
++    media_format_destroy(media_format_);
++    media_format_ = nullptr;
++  }
++}
++
++void HybrisMediaCodecVideoDecoder::Reset(base::OnceClosure closure)  {
++  std::lock_guard<decltype(running_mutex_)> lk(running_mutex_);
++  pump_codec_timer_.Stop();
++  media_codec_flush(media_codec_);
++  std::move(closure).Run();
++}
++
++bool HybrisMediaCodecVideoDecoder::NeedsBitstreamConversion() const  {
++  return true;
++}
++
++bool HybrisMediaCodecVideoDecoder::CanReadWithoutStalling() const  {
++  return false;
++}
++
++int HybrisMediaCodecVideoDecoder::GetMaxDecodeRequests() const  {
++  return n_buffers_in_;
++}
++
++std::string HybrisMediaCodecVideoDecoder::GetDisplayName() const  {
++  return "HybrisMediaCodecVideoDecoder";
++}
++
++void HybrisMediaCodecVideoDecoder::Reconfigure(const VideoDecoderConfig config, InitCB init_cb) {
++  LOG(INFO) << "Configuring decoder: " << config.AsHumanReadableString();
++
++  const int32_t width = config.coded_size().width();
++  const int32_t height = config.coded_size().height();
++  const int32_t buf_size = width * height;
++
++  decoder_context_->MakeCurrent();
++  gl_texture = decoder_helper_->CreateTexture(GL_TEXTURE_EXTERNAL_OES, GL_RGBA, width, height, GL_RGBA, GL_UNSIGNED_BYTE);
++
++  stc_ = surface_texture_client_create_by_id(gl_texture->service_id());
++  if (!stc_) {
++    LOG(ERROR) << "Error in " << __func__ << ":" << __LINE__;
++    std::move(init_cb).Run(StatusCode::kDecoderInitializationFailed);
++    return;
++  }
++
++  surface_texture_client_set_hardware_rendering(stc_, true);
++  media_format_ = media_format_create_video_format(codec_type_.c_str(), width, height, 0, buf_size);
++
++  // TODO:
++  if (config.codec() == kCodecH264) {
++    ExtractSpsAndPps(config.extra_data(), &csd0_, &csd1_);
++    media_format_set_byte_buffer(media_format_, "csd-0", csd0_.data(), csd0_.size());
++  }
++
++  int ret = media_codec_configure(media_codec_, media_format_, stc_, 0);
++
++  if (ret > 0) {
++    LOG(ERROR) << "Error in " << __func__ << ":" << __LINE__ << ": ret=" << ret;
++    std::move(init_cb).Run(StatusCode::kDecoderInitializationFailed);
++    return;
++  }
++
++  if (!running_) {
++    std::lock_guard<decltype(running_mutex_)> lk(running_mutex_);
++
++    LOG(INFO) << "Starting media codec";
++    ret = media_codec_start(media_codec_);
++    if (ret < 0) {
++      LOG(ERROR) << "Error in " << __func__ << ":" << __LINE__ << ": ret=" << ret;
++      std::move(init_cb).Run(StatusCode::kDecoderInitializationFailed);
++      return;
++    }
++
++    running_ = true;
++
++    RecreateInputBuffers();
++    RecreateOutputBuffers();
++  }
++
++  std::move(init_cb).Run(OkStatus());
++  LOG(INFO) << "Codec configured";
++  return;
++}
++
++void HybrisMediaCodecVideoDecoder::ExtractSpsAndPps(
++     const std::vector<uint8_t>& avcc,
++     std::vector<uint8_t>* sps_out,
++     std::vector<uint8_t>* pps_out) {
++  if (avcc.empty())
++    return;
++
++  mp4::AVCDecoderConfigurationRecord record;
++  if (!record.Parse(avcc.data(), avcc.size())) {
++    DVLOG(1) << "Failed to extract SPS and PPS";
++    return;
++  }
++
++  constexpr std::array<uint8_t, 4> prefix = {{0, 0, 0, 1}};
++  for (const std::vector<uint8_t>& sps : record.sps_list) {
++    sps_out->insert(sps_out->end(), prefix.begin(), prefix.end());
++    sps_out->insert(sps_out->end(), sps.begin(), sps.end());
++  }
++
++  for (const std::vector<uint8_t>& pps : record.pps_list) {
++    pps_out->insert(pps_out->end(), prefix.begin(), prefix.end());
++    pps_out->insert(pps_out->end(), pps.begin(), pps.end());
++  }
++}
++
++void HybrisMediaCodecVideoDecoder::RunPipeline(QueuedBuffer& pending_output) {
++  int ret = 0;
++
++  {
++    // Get the decoded frame
++    MediaCodecBufferInfo buffer_info_out;
++    memset(&buffer_info_out, 0, sizeof(buffer_info_out));
++
++    ret = media_codec_dequeue_output_buffer(media_codec_, &buffer_info_out, queue_timeout_);
++    LOG(INFO) << "buffer_into_out.flags: " << buffer_info_out.flags << ", ret: " << ret;
++    const bool is_eos = (buffer_info_out.flags & BUFFER_FLAG_END_OF_STREAM);
++    bool has_frame_available = false;
++
++    if (ret == INFO_TRY_AGAIN_LATER) {
++      goto ok;
++    } else if (ret == INFO_OUTPUT_BUFFERS_CHANGED) {
++      RecreateOutputBuffers();
++    } else if (ret == INFO_OUTPUT_FORMAT_CHANGED) {
++      RecreateGeometry();
++    } else if (ret >= 0) {
++      has_frame_available = true;
++    }
++
++    media_codec_release_output_buffer(media_codec_, buffer_info_out.index, !is_eos);
++
++ok:
++    if (has_frame_available)
++      FrameAvailable(buffer_info_out.presentation_time_us);
++
++    std::move(pending_output.decode_cb).Run(DecodeStatus::OK);
++  }
++}
++
++bool HybrisMediaCodecVideoDecoder::RecreateInputBuffers() {
++  codec_input_buffers_.clear();
++  n_buffers_in_ = media_codec_get_input_buffers_size(media_codec_);
++  if (n_buffers_in_ <= 0) {
++    return false;
++  }
++
++  for (int32_t i = 0; i < n_buffers_in_; i++) {
++    MediaCodecBuffer media_codec_buffer;
++    media_codec_buffer.data = media_codec_get_nth_input_buffer(media_codec_, i);
++    media_codec_buffer.size = media_codec_get_nth_input_buffer_capacity(media_codec_, i);
++    codec_input_buffers_.push_back(media_codec_buffer);
++  }
++
++  return true;
++}
++
++bool HybrisMediaCodecVideoDecoder::RecreateOutputBuffers() {
++  n_buffers_out_ = media_codec_get_output_buffers_size(media_codec_);
++  if (n_buffers_out_ <= 0) {
++    return false;
++  }
++  for (int32_t i = 0; i < n_buffers_out_; i++) {
++    media_codec_get_nth_output_buffer(media_codec_, i);
++    media_codec_get_nth_output_buffer_capacity(media_codec_, i);
++  }
++  return true;
++}
++
++void HybrisMediaCodecVideoDecoder::RecreateGeometry()
++{
++  MediaFormat output_format = media_codec_get_output_format(media_codec_);
++
++  const int width = media_format_get_width(output_format);
++  const int height = media_format_get_height(output_format);
++  const int crop_left = media_format_get_crop_left(output_format);
++  const int crop_right = media_format_get_crop_right(output_format);
++  const int crop_bottom = media_format_get_crop_bottom(output_format);
++  const int crop_top = media_format_get_crop_top(output_format);
++
++  media_format_destroy(output_format);
++
++  gfx::Size coded_size(width, height);
++  gfx::Rect visible_rect(crop_left, crop_top, width - crop_right - crop_left, height - crop_bottom - crop_top);
++  gfx::Size natural_size(width, height);
++
++  coded_size_ = coded_size;
++  visible_rect_ = visible_rect;
++  natural_size_ = natural_size;
++}
++
++size_t HybrisMediaCodecVideoDecoder::SkipForbiddenNALUs(const uint8_t* data, size_t size)
++{
++  if (config_.codec() == VideoCodec::kCodecH264) {
++    LOG(INFO) << "H264";
++    if (size > 4 &&
++        data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01) {
++      LOG(INFO) << "NAL header";
++      return 1;
++    } else if (size > 5 &&
++        data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x01) {
++      LOG(INFO) << "NAL header";
++      return 1;
++    }
++  } else if (config_.codec() == VideoCodec::kCodecHEVC) {
++    // TODO
++  }
++
++  return 0;
++}
++
++bool HybrisVideoDecoder::IsSupported() {
++  static const bool hybris_available = media_compat_check_availability();
++  return hybris_available;
++}
++
++std::unique_ptr<VideoDecoder> HybrisVideoDecoder::Create(
++    scoped_refptr<base::SingleThreadTaskRunner> task_runner,
++    scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++    GetStubCB stub_cb) {
++  return std::unique_ptr<VideoDecoder>(new HybrisMediaCodecVideoDecoder(task_runner, gpu_task_runner, stub_cb));
++}
++
++}  // namespace media
+diff --git a/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.h b/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.h
+new file mode 100644
+index 000000000..c1443e777
+--- /dev/null
++++ b/qtwebengine-chromium/chromium/media/gpu/hybris/video_decoder_hybris.h
+@@ -0,0 +1,166 @@
++// Copyright 2022 Alfred Neumayer. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_VIDEO_DECODE_HYBRIS_ACCELERATOR_OVERRIDE_H_
++#define MEDIA_GPU_VIDEO_DECODE_HYBRIS_ACCELERATOR_OVERRIDE_H_
++
++#include "media/base/video_decoder.h"
++#include "media/base/video_decoder_config.h"
++#include "media/gpu/media_gpu_export.h"
++#include "media/video/supported_video_decoder_config.h"
++#include "base/memory/ptr_util.h"
++#include "base/timer/timer.h"
++#include "gpu/config/gpu_preferences.h"
++#include "media/gpu/gles2_decoder_helper.h"
++#include "gpu/command_buffer/service/mailbox_manager.h"
++#include "gpu/command_buffer/service/texture_manager.h"
++#include "media/base/video_frame.h"
++
++#include <memory>
++#include <set>
++#include <vector>
++#include <chrono>
++#include <mutex>
++#include <condition_variable>
++
++#include <hybris/media/media_codec_list.h>
++#include <hybris/media/media_codec_layer.h>
++#include <hybris/media/media_format_layer.h>
++#include <hybris/media/surface_texture_client_hybris.h>
++
++namespace gpu {
++class CommandBufferStub;
++}
++
++namespace media {
++
++using GetStubCB = base::RepeatingCallback<gpu::CommandBufferStub*()>;
++typedef std::function<void(int)> BufferDoneCB;
++
++class MEDIA_GPU_EXPORT HybrisMediaCodecVideoDecoder : public VideoDecoder
++{
++public:
++  static std::vector<SupportedVideoDecoderConfig> GetSupportedConfigs();
++
++  HybrisMediaCodecVideoDecoder(
++      scoped_refptr<base::SingleThreadTaskRunner> task_runner,
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++      GetStubCB stub_cb);
++
++protected:
++  ~HybrisMediaCodecVideoDecoder() override;
++
++private:
++  static std::vector<SupportedVideoDecoderConfig> GetSupportedConfigsInternal();
++  static bool IsSupportedProfile(VideoCodecProfile type);
++  static bool IsSupported(VideoCodecProfile type);
++  static const char* MimeTypeForCodecType(VideoCodecProfile type);
++  static std::string FindSuitableCodec(const std::string& codec_type, const bool hwCodecOnly);
++  static void OnFrameAvailable(GLConsumerWrapperHybris, void* data);
++
++public:
++  void Initialize(const VideoDecoderConfig& config,
++                  bool low_delay,
++                  CdmContext* cdm_context,
++                  InitCB init_cb,
++                  const OutputCB& output_cb,
++                  const WaitingCB& waiting_cb) override;
++
++  void Decode(scoped_refptr<DecoderBuffer> buffer, DecodeCB decode_cb) override;
++
++  void FrameAvailable(int64_t timestamp);
++  void RedrawTexture(int64_t timestamp);
++  void Destroy();
++
++  // Decoder implementation
++  bool IsPlatformDecoder() const final;
++  bool SupportsDecryption() const final;
++  std::string GetDisplayName() const final;
++
++  // VideoDecoder implementation
++  void Reset(base::OnceClosure closure) override;
++  bool NeedsBitstreamConversion() const override;
++  bool CanReadWithoutStalling() const override;
++  int GetMaxDecodeRequests() const override;
++
++private:
++  struct QueuedBuffer {
++    scoped_refptr<DecoderBuffer> buffer;
++    DecodeCB decode_cb;
++  };
++
++  struct MediaCodecBuffer {
++    uint8_t* data;
++    size_t size;
++  };
++
++  void Reconfigure(const VideoDecoderConfig config, InitCB init_cb);
++  bool ProcessInput(
++    QueuedBuffer& in_flight_buffer);
++  void EnqueueOrderedInput(
++    scoped_refptr<DecoderBuffer> buffer,
++    DecodeCB decode_cb);
++  void PumpCodec();
++  void RunPipeline(QueuedBuffer& pending_output);
++  void ExtractSpsAndPps(
++    const std::vector<uint8_t>& avcc,
++    std::vector<uint8_t>* sps_out,
++    std::vector<uint8_t>* pps_out);
++  bool RecreateInputBuffers();
++  bool RecreateOutputBuffers();
++  void RecreateGeometry();
++
++  size_t SkipForbiddenNALUs(const uint8_t* data, size_t size);
++
++  OutputCB output_cb_;
++  DecodeCB eos_decode_cb_;
++  bool eos_cb_called_;
++
++  bool running_;
++
++  int32_t n_buffers_in_;
++  int32_t n_buffers_out_;
++
++  std::vector<MediaCodecBuffer> codec_input_buffers_;
++  int32_t queue_timeout_;
++
++  std::mutex redraw_mutex_;
++  std::mutex running_mutex_;
++
++  MediaCodecDelegate media_codec_;
++  MediaFormat media_format_;
++  SurfaceTextureClientHybris stc_;
++
++  gpu::DecoderContext* decoder_context_;
++  std::unique_ptr<GLES2DecoderHelper> decoder_helper_;
++  std::unique_ptr<gpu::gles2::AbstractTexture> gl_texture;
++
++  std::string codec_type_;
++  VideoDecoderConfig config_;
++
++  scoped_refptr<base::SingleThreadTaskRunner> pending_output_runner_;
++  scoped_refptr<base::SingleThreadTaskRunner> task_runner_;
++  scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner_;
++  base::RepeatingTimer pump_codec_timer_;
++  std::deque<QueuedBuffer> queue_;
++
++  gfx::Size coded_size_;
++  gfx::Rect visible_rect_;
++  gfx::Size natural_size_;
++  std::vector<uint8_t> csd0_;
++  std::vector<uint8_t> csd1_;
++};
++
++class MEDIA_GPU_EXPORT HybrisVideoDecoder {
++ public:
++  static bool IsSupported();
++  static std::unique_ptr<VideoDecoder> Create(
++      scoped_refptr<base::SingleThreadTaskRunner> task_runner,
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++      GetStubCB stub_cb);
++};
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_VIDEO_DECODE_HYBRIS_ACCELERATOR_OVERRIDE_H_
+diff --git a/qtwebengine-chromium/chromium/media/media_options.gni b/qtwebengine-chromium/chromium/media/media_options.gni
+index acacfcd62..852d9b745 100644
+--- a/qtwebengine-chromium/chromium/media/media_options.gni
++++ b/qtwebengine-chromium/chromium/media/media_options.gni
+@@ -213,7 +213,7 @@ if (is_chromecast) {
+     "video_decoder",
+   ]
+   _default_mojo_media_host = "gpu"
+-} else if (is_chromeos || is_mac || is_win || (is_linux && use_vaapi)) {
++} else if (is_chromeos || is_mac || is_win || is_linux) {
+   _default_mojo_media_services = [ "video_decoder" ]
+   _default_mojo_media_host = "gpu"
+ }
+diff --git a/qtwebengine-chromium/chromium/media/mojo/services/BUILD.gn b/qtwebengine-chromium/chromium/media/mojo/services/BUILD.gn
+index 0782f9fd2..efa3220b4 100644
+--- a/qtwebengine-chromium/chromium/media/mojo/services/BUILD.gn
++++ b/qtwebengine-chromium/chromium/media/mojo/services/BUILD.gn
+@@ -4,9 +4,14 @@
+ 
+ import("//build/config/chromecast_build.gni")
+ import("//build/config/jumbo.gni")
++import("//build/config/linux/pkg_config.gni")
+ import("//media/media_options.gni")
+ import("//testing/test.gni")
+ 
++pkg_config("libmedia") {
++  packages = [ "libmedia" ]
++}
++
+ jumbo_component("services") {
+   output_name = "media_mojo_services"
+   sources = [
+@@ -144,6 +149,9 @@ jumbo_component("services") {
+     deps +=
+         [ "//chromeos/components/cdm_factory_daemon:cdm_factory_daemon_gpu" ]
+   }
++  if (is_linux) {
++    defines += [ "ENABLE_HYBRIS_MEDIA" ]
++  }
+ }
+ 
+ source_set("unit_tests") {
+diff --git a/qtwebengine-chromium/chromium/media/mojo/services/gpu_mojo_media_client.cc b/qtwebengine-chromium/chromium/media/mojo/services/gpu_mojo_media_client.cc
+index b1f553ce7..4d53d0c05 100644
+--- a/qtwebengine-chromium/chromium/media/mojo/services/gpu_mojo_media_client.cc
++++ b/qtwebengine-chromium/chromium/media/mojo/services/gpu_mojo_media_client.cc
+@@ -40,6 +40,10 @@
+ #include "media/mojo/services/mojo_provision_fetcher.h"
+ #endif  // defined(OS_ANDROID)
+ 
++#if defined(ENABLE_HYBRIS_MEDIA)
++#include "media/gpu/hybris/video_decoder_hybris.h"
++#endif
++
+ #if defined(OS_WIN)
+ #include "media/gpu/windows/d3d11_video_decoder.h"
+ #include "ui/gl/direct_composition_surface_win.h"
+@@ -168,9 +172,16 @@ GpuMojoMediaClient::GetSupportedVideoDecoderConfigs() {
+        MediaCodecVideoDecoder::GetSupportedConfigs()},
+   };
+   return supported_configs;
++
++#elif defined(ENABLE_HYBRIS_MEDIA)
++  static SupportedVideoDecoderConfigMap supported_configs{
++      {VideoDecoderImplementation::kDefault,
++       HybrisMediaCodecVideoDecoder::GetSupportedConfigs()},
++  };
++  return supported_configs;
++
+ #else
+   SupportedVideoDecoderConfigMap supported_config_map;
+-
+ #if defined(OS_WIN)
+   // Start with the configurations supported by D3D11VideoDecoder.
+   // VdaVideoDecoder is still used as a fallback.
+@@ -305,13 +316,23 @@ std::unique_ptr<VideoDecoder> GpuMojoMediaClient::CreateVideoDecoder(
+       if (gpu_workarounds_.disable_dxva_video_decoder)
+         return nullptr;
+ #endif  // defined(OS_WIN)
+-      video_decoder = VdaVideoDecoder::Create(
+-          task_runner, gpu_task_runner_, media_log->Clone(), target_color_space,
+-          gpu_preferences_, gpu_workarounds_,
+-          base::BindRepeating(&GetCommandBufferStub, gpu_task_runner_,
+-                              media_gpu_channel_manager_,
+-                              command_buffer_id->channel_token,
+-                              command_buffer_id->route_id));
++#if defined(ENABLE_HYBRIS_MEDIA)
++      if (HybrisVideoDecoder::IsSupported())
++        video_decoder = HybrisVideoDecoder::Create(
++            task_runner, gpu_task_runner_,
++            base::BindRepeating(&GetCommandBufferStub, gpu_task_runner_,
++                                media_gpu_channel_manager_,
++                                command_buffer_id->channel_token,
++                                command_buffer_id->route_id));
++      else
++#endif // defined(ENABLE_HYBRIS_MEDIA)
++        video_decoder = VdaVideoDecoder::Create(
++            task_runner, gpu_task_runner_, media_log->Clone(), target_color_space,
++            gpu_preferences_, gpu_workarounds_,
++            base::BindRepeating(&GetCommandBufferStub, gpu_task_runner_,
++                                media_gpu_channel_manager_,
++                                command_buffer_id->channel_token,
++                                command_buffer_id->route_id));
+ #endif  // defined(OS_ANDROID)
+     } break;
+ 
+diff --git a/src/core/core_module.pro b/src/core/core_module.pro
+index 75e8488b4..16af9caa7 100644
+--- a/src/core/core_module.pro
++++ b/src/core/core_module.pro
+@@ -11,7 +11,7 @@ api_library_name = qtwebenginecoreapi$$qtPlatformTargetSuffix()
+ api_library_path = $$OUT_PWD/api/$$getConfigDir()
+ LIBS_PRIVATE += -L$$api_library_path
+ linux:LIBS_PRIVATE += -landroid-properties
+-linux:LIBS_PRIVATE += -lhybris-common -lcamera
++linux:LIBS_PRIVATE += -lhybris-common -lcamera -lmedia
+ CONFIG *= no_smart_library_merge
+ osx {
+     LIBS_PRIVATE += -Wl,-force_load,$${api_library_path}$${QMAKE_DIR_SEP}lib$${api_library_name}.a
+-- 
+2.37.0 (Apple Git-136)
+
