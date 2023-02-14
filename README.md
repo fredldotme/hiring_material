@@ -12,6 +12,7 @@ About me:
 Notable projects:
 -----------------
 
+- [Regular contributor to Lomiri](https://lomiri.com)
 - [GhostCloud](https://github.com/fredldotme/harbour-owncloud)
 - [GhostCloud for macOS](https://github.com/fredldotme/GhostCloud-macOS)
 - [QEMU with patches for running *on* Ubuntu Touch](https://github.com/fredldotme/qemu)
