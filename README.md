@@ -2,8 +2,10 @@ Review material for hiring
 --------------------------
 
 About me:
+
 - Core developer on Halium & Ubuntu Touch
 - Kernel hacker
+- Tide C++ IDE developer
 - Developer of various apps
 - Engineering of APIs for user-space applications
 - Experience in multimedia, digital signage, and more.
@@ -12,6 +14,7 @@ About me:
 Notable projects:
 -----------------
 
+- [Tide](https://github.com/fredldotme/tide)
 - [Regular contributor to Lomiri](https://lomiri.com)
 - [GhostCloud](https://github.com/fredldotme/harbour-owncloud)
 - [GhostCloud for macOS](https://github.com/fredldotme/GhostCloud-macOS)
